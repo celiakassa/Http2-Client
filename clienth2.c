@@ -14,6 +14,9 @@
 #include <netinet/tcp.h>
 #define FAIL    -1
 
+
+
+
 enum { IO_NONE, WANT_READ, WANT_WRITE };
 
 #define MAKE_NV(NAME, VALUE)                                                   \
@@ -83,6 +86,7 @@ static void submit_request(struct Connection *connection, struct Request *req) {
   req->stream_id = stream_id;
   printf("[INFO] Stream ID = %d\n", stream_id);
 }
+
 static void make_non_block(int fd) {
   int flags, rv;
   while ((flags = fcntl(fd, F_GETFL, 0)) == -1 && errno == EINTR)
@@ -130,19 +134,25 @@ int OpenConnection(const char *hostname, int port)
     return sd;
 }
 
-SSL_CTX* InitCTX(void)
-{   
-//SSL_METHOD *method;
+SSL_CTX* InitCTX(void) { 
+    int ret;  
+    //SSL_METHOD *method;
     SSL_CTX *ctx;
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();  /* Load cryptos, et.al. */
-    SSL_load_error_strings();   /* Bring in and register error messages */
+    /*SSL_library_init();
+    OpenSSL_add_all_algorithms(); */ /* Load cryptos, et.al. */
+    ret = OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS |
+           OPENSSL_INIT_ADD_ALL_CIPHERS | OPENSSL_INIT_ADD_ALL_DIGESTS, (OPENSSL_INIT_SETTINGS *)NULL);
+    if(!ret){
+        ERR_print_errors_fp(stderr);
+        return (SSL_CTX*) NULL;
+    }
+    
+    /* SSL_load_error_strings();   Bring in and register error messages */
    // method = TLSv1_2_client_method();  /* Create new client-method instance */
     ctx = SSL_CTX_new(SSLv23_client_method());   /* Create new context */
-    if ( ctx == NULL )
-    {
+    if ( ctx == NULL ){
         ERR_print_errors_fp(stderr);
-        abort();
+        return (SSL_CTX*) NULL;
     }
     return ctx;
 }
@@ -167,51 +177,313 @@ void ShowCerts(SSL* ssl)
         printf("Info: No client certificates configured.\n");
 }
 
-int main(int count, char *strings[])
-{   SSL_CTX *ctx;
+/*
+ * The implementation of nghttp2_send_callback type. Here we write
+ * |data| with size |length| to the network and return the number of
+ * bytes actually written. See the documentation of
+ * nghttp2_send_callback for the details.
+ */
+static ssize_t send_callback(nghttp2_session *session, const uint8_t *data,
+                             size_t length, int flags, void *user_data) {
+  struct Connection *connection;
+  int rv;
+  (void)session;
+  (void)flags;
+
+  connection = (struct Connection *)user_data;
+  connection->want_io = IO_NONE;
+  ERR_clear_error();
+  rv = SSL_write(connection->ssl, data, (int)length);
+  if (rv <= 0) {
+    int err = SSL_get_error(connection->ssl, rv);
+    if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+      connection->want_io =
+          (err == SSL_ERROR_WANT_READ ? WANT_READ : WANT_WRITE);
+      rv = NGHTTP2_ERR_WOULDBLOCK;
+    } else {
+      rv = NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+  }
+  return rv;
+}
+
+/*
+ * The implementation of nghttp2_recv_callback type. Here we read data
+ * from the network and write them in |buf|. The capacity of |buf| is
+ * |length| bytes. Returns the number of bytes stored in |buf|. See
+ * the documentation of nghttp2_recv_callback for the details.
+ */
+static ssize_t recv_callback(nghttp2_session *session, uint8_t *buf,
+                             size_t length, int flags, void *user_data) {
+  struct Connection *connection;
+  int rv;
+  (void)session;
+  (void)flags;
+
+  connection = (struct Connection *)user_data;
+  connection->want_io = IO_NONE;
+  ERR_clear_error();
+  rv = SSL_read(connection->ssl, buf, (int)length);
+  if (rv < 0) {
+    int err = SSL_get_error(connection->ssl, rv);
+    if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+      connection->want_io =
+          (err == SSL_ERROR_WANT_READ ? WANT_READ : WANT_WRITE);
+      rv = NGHTTP2_ERR_WOULDBLOCK;
+    } else {
+      rv = NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+  } else if (rv == 0) {
+    rv = NGHTTP2_ERR_EOF;
+  }
+  return rv;
+}
+
+static int on_frame_send_callback(nghttp2_session *session,
+                                  const nghttp2_frame *frame, void *user_data) {
+  size_t i;
+  (void)user_data;
+
+  switch (frame->hd.type) {
+  case NGHTTP2_HEADERS:
+    if (nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)) {
+      const nghttp2_nv *nva = frame->headers.nva;
+      printf("[INFO] C ----------------------------> S (HEADERS)\n");
+      for (i = 0; i < frame->headers.nvlen; ++i) {
+        fwrite(nva[i].name, 1, nva[i].namelen, stdout);
+        printf(": ");
+        fwrite(nva[i].value, 1, nva[i].valuelen, stdout);
+        printf("\n");
+      }
+    }
+    break;
+  case NGHTTP2_RST_STREAM:
+    printf("[INFO] C ----------------------------> S (RST_STREAM)\n");
+    break;
+  case NGHTTP2_GOAWAY:
+    printf("[INFO] C ----------------------------> S (GOAWAY)\n");
+    break;
+  }
+  return 0;
+}
+
+static int on_frame_recv_callback(nghttp2_session *session,
+                                  const nghttp2_frame *frame, void *user_data) {
+  size_t i;
+  (void)user_data;
+
+  switch (frame->hd.type) {
+  case NGHTTP2_HEADERS:
+    if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
+      const nghttp2_nv *nva = frame->headers.nva;
+      struct Request *req;
+      req = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+      if (req) {
+        printf("[INFO] C <---------------------------- S (HEADERS)\n");
+        for (i = 0; i < frame->headers.nvlen; ++i) {
+          fwrite(nva[i].name, 1, nva[i].namelen, stdout);
+          printf(": ");
+          fwrite(nva[i].value, 1, nva[i].valuelen, stdout);
+          printf("\n");
+        }
+      }
+    }
+    break;
+  case NGHTTP2_RST_STREAM:
+    printf("[INFO] C <---------------------------- S (RST_STREAM)\n");
+    break;
+  case NGHTTP2_GOAWAY:
+    printf("[INFO] C <---------------------------- S (GOAWAY)\n");
+    break;
+  }
+  return 0;
+}
+
+/*
+ * The implementation of nghttp2_on_stream_close_callback type. We use
+ * this function to know the response is fully received. Since we just
+ * fetch 1 resource in this program, after reception of the response,
+ * we submit GOAWAY and close the session.
+ */
+static int on_stream_close_callback(nghttp2_session *session, int32_t stream_id,
+                                    uint32_t error_code, void *user_data) {
+  struct Request *req;
+  (void)error_code;
+  (void)user_data;
+
+  req = nghttp2_session_get_stream_user_data(session, stream_id);
+  if (req) {
+    int rv;
+    rv = nghttp2_session_terminate_session(session, NGHTTP2_NO_ERROR);
+
+    if (rv != 0) {
+      diec("nghttp2_session_terminate_session", rv);
+    }
+  }
+  return 0;
+}
+
+/*
+ * The implementation of nghttp2_on_data_chunk_recv_callback type. We
+ * use this function to print the received response body.
+ */
+static int on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags,
+                                       int32_t stream_id, const uint8_t *data,
+                                       size_t len, void *user_data) {
+  struct Request *req;
+  (void)flags;
+  (void)user_data;
+
+  req = nghttp2_session_get_stream_user_data(session, stream_id);
+  if (req) {
+    printf("[INFO] C <---------------------------- S (DATA chunk)\n"
+           "%lu bytes\n",
+           (unsigned long int)len);
+    fwrite(data, 1, len, stdout);
+    printf("\n");
+  }
+  return 0;
+}
+
+/*
+ * Setup callback functions. nghttp2 API offers many callback
+ * functions, but most of them are optional. The send_callback is
+ * always required. Since we use nghttp2_session_recv(), the
+ * recv_callback is also required.
+ */
+static void setup_nghttp2_callbacks(nghttp2_session_callbacks *callbacks) {
+  nghttp2_session_callbacks_set_send_callback(callbacks, send_callback);
+
+  nghttp2_session_callbacks_set_recv_callback(callbacks, recv_callback);
+
+  nghttp2_session_callbacks_set_on_frame_send_callback(callbacks,
+                                                       on_frame_send_callback);
+
+  nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks,
+                                                       on_frame_recv_callback);
+
+  nghttp2_session_callbacks_set_on_stream_close_callback(
+      callbacks, on_stream_close_callback);
+
+  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
+      callbacks, on_data_chunk_recv_callback);
+}
+
+int main(int count, char *argv[]) {   
+    SSL_CTX *ctx;
     int fd;
     SSL *ssl;
     char buf[1024];
-     struct Request req;
-  	struct Connection connection;
-  	int rv;
+    struct Request req;
+    struct Connection connection;
+    int rv, ret;
     int bytes;
     char *hostname, *portnum;
+    nghttp2_session_callbacks *callbacks;
 
-    if ( count != 3 )
-    {
-        printf("usage: %s <hostname> <portnum>\n", strings[0]);
+    if ( count != 4 ){
+        printf("usage: %s <hostname> <portnum>\n", argv[0]);
         exit(0);
     }
-    SSL_library_init();
-    hostname=strings[1];
-    portnum=strings[2];
-
-    ctx = InitCTX();
+    hostname = argv[1];
+    portnum = argv[2];
+    
+    //init request
+    req.host = (char*) malloc(strlen(hostname)*sizeof(char));
+    req.path = (char*) malloc(strlen(argv[3])*sizeof(char));
+    req.hostport = (char*) malloc((strlen(hostname)+strlen(portnum)+1)*sizeof(char));
+    
+    strncpy(req.host, hostname, strlen(hostname));
+    strncpy(req.path, argv[3], strlen(argv[3]));
+    req.hostport = strcat(req.host, ":");
+    req.hostport = strcat(req.hostport, portnum);
+    req.port = atoi(portnum);
+    
+    /**TCP connection step**/
+    
     fd = OpenConnection(hostname, atoi(portnum));
-    ssl = SSL_new(ctx);      /* create new SSL connection state */
-    SSL_set_fd(ssl, fd);    /* attach the socket descriptor */
-    if ( SSL_connect(ssl) == FAIL )   /* perform the connection */
-        ERR_print_errors_fp(stderr);
-    else
-    {   char *msg = "Hello???";
-
-        printf("Connected with %s encryption\n", SSL_get_cipher(ssl));
-        ShowCerts(ssl);        /* get any certs */
-       connection.ssl = ssl;
- 	 connection.want_io = IO_NONE; 
+    
+    if(fd < 0){
+       fprintf(stderr, "Unable to establish TCP connection\n");
+       exit(1);
     }
+    /**End TCP connection step**/
+    
+    /** OpenSSL handshake **/
+    ctx = InitCTX();
+    if(ctx == NULL){
+        fprintf(stderr, "Unable to initialize OpenSSL context\n");
+        exit(1);
+    }
+  
+    ssl = SSL_new(ctx);      /* create new SSL connection state */
+    if(ssl == NULL){
+        ERR_print_errors_fp(stderr); 
+        exit(1);
+    }
+    
+    ret = SSL_set_fd(ssl, fd);    /* attach the socket descriptor */
+    if(!ret){
+        ERR_print_errors_fp(stderr); 
+        exit(1);
+    }
+    ret = SSL_connect(ssl);
+    
+    if (!ret){   /* perform the connection */
+        ERR_print_errors_fp(stderr);
+    }
+    /** end handshake **/
+    
+    //else
+    //{   char *msg = "Hello???";
+    //ShowCerts(ssl);        /* get any certs */
+    connection.ssl = ssl;
+    connection.want_io = IO_NONE; 
+    //}
     /* Here make file descriptor non-block */
- 	 make_non_block(fd);
-  	set_tcp_nodelay(fd);
+    make_non_block(fd);
+    set_tcp_nodelay(fd);
 
-  	printf("[INFO] SSL/TLS handshake completed\n");
-	/* Submit the HTTP request to the outbound queue. */
+    ret = nghttp2_session_callbacks_new(&callbacks);
+    
+    if(ret != 0){
+       fprintf(stderr, "Unable to create session callback");
+       exit(1);
+    }
+    
+    setup_nghttp2_callbacks(callbacks);
+    
+    ret = nghttp2_session_client_new(&connection.session, callbacks, &connection);
+    
+    nghttp2_session_callbacks_del(callbacks);
+    
+    if(ret != 0){
+       fprintf(stderr, "Failed to initialize session callback\n");
+       exit(1);
+    }
+    
+    ret = nghttp2_submit_settings(connection.session, NGHTTP2_FLAG_NONE, NULL, 0);
+    
+    if(ret != 0){
+       fprintf(stderr, "Failed to submit NGHTTP2 settings\n");
+       exit(1);
+    }
+    
+    
+    
+    /* Submit the HTTP request to the outbound queue. */
     submit_request(&connection, &req);
+    
+    printf("before cleaning\n\n");
+    goto clean;
 
-     SSL_free(ssl);        /* release connection state */
-    close(fd);         /* close socket */
+    
+   
+   
+clean:    
+    SSL_free(ssl);        /* release connection state */
     SSL_CTX_free(ctx);        /* release context */
+    close(fd);         /* close socket */
     return 0;
 }
 
