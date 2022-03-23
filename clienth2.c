@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <openssl/conf.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #define FAIL    -1
 
 
@@ -134,6 +135,48 @@ int OpenConnection(const char *hostname, int port)
     return sd;
 }
 
+#ifndef OPENSSL_NO_NEXTPROTONEG
+/*
+ * Callback function for TLS NPN. Since this program only supports
+ * HTTP/2 protocol, if server does not offer HTTP/2 the nghttp2
+ * library supports, we terminate program.
+ */
+static int select_next_proto_cb(SSL *ssl, unsigned char **out,
+                                unsigned char *outlen, const unsigned char *in,
+                                unsigned int inlen, void *arg) {
+  int rv;
+  (void)ssl;
+  (void)arg;
+
+  /* nghttp2_select_next_protocol() selects HTTP/2 protocol the
+     nghttp2 library supports. */
+  rv = nghttp2_select_next_protocol(out, outlen, in, inlen);
+  if (rv <= 0) {
+    fprintf(stderr, "Server did not advertise HTTP/2 protocol");
+  }
+  return SSL_TLSEXT_ERR_OK;
+}
+#endif /* !OPENSSL_NO_NEXTPROTONEG */
+
+
+/*
+ * Setup SSL/TLS context.
+ */
+static void init_ssl_ctx(SSL_CTX *ssl_ctx) {
+  /* Disable SSLv2 and enable all workarounds for buggy servers */
+  SSL_CTX_set_options(ssl_ctx, SSL_OP_ALL | SSL_OP_NO_SSLv2);
+  SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
+  SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
+  /* Set NPN callback */
+#ifndef OPENSSL_NO_NEXTPROTONEG
+  SSL_CTX_set_next_proto_select_cb(ssl_ctx, select_next_proto_cb, NULL);
+#endif /* !OPENSSL_NO_NEXTPROTONEG */
+
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+  SSL_CTX_set_alpn_protos(ssl_ctx, (const unsigned char *)"\x02h2", 3);
+#endif /* OPENSSL_VERSION_NUMBER >= 0x10002000L */
+}
+
 SSL_CTX* InitCTX(void) { 
     int ret;  
     //SSL_METHOD *method;
@@ -149,7 +192,7 @@ SSL_CTX* InitCTX(void) {
     
     /* SSL_load_error_strings();   Bring in and register error messages */
    // method = TLSv1_2_client_method();  /* Create new client-method instance */
-    ctx = SSL_CTX_new(SSLv23_client_method());   /* Create new context */
+    ctx = SSL_CTX_new(TLS_client_method());   /* Create new context */
     if ( ctx == NULL ){
         ERR_print_errors_fp(stderr);
         return (SSL_CTX*) NULL;
@@ -369,6 +412,37 @@ static void setup_nghttp2_callbacks(nghttp2_session_callbacks *callbacks) {
       callbacks, on_data_chunk_recv_callback);
 }
 
+/*
+ * Update |pollfd| based on the state of |connection|.
+ */
+static void ctl_poll(struct pollfd *pollfd, struct Connection *connection) {
+  pollfd->events = 0;
+  if (nghttp2_session_want_read(connection->session) ||
+      connection->want_io == WANT_READ) {
+    pollfd->events |= POLLIN;
+  }
+  if (nghttp2_session_want_write(connection->session) ||
+      connection->want_io == WANT_WRITE) {
+    pollfd->events |= POLLOUT;
+  }
+}
+
+/*
+ * Performs the network I/O.
+ */
+static void exec_io(struct Connection *connection) {
+  int rv;
+  rv = nghttp2_session_recv(connection->session);
+  if (rv != 0) {
+    diec("nghttp2_session_recv", rv);
+  }
+  rv = nghttp2_session_send(connection->session);
+  if (rv != 0) {
+    diec("nghttp2_session_send", rv);
+  }
+}
+
+
 int main(int count, char *argv[]) {   
     SSL_CTX *ctx;
     int fd;
@@ -380,6 +454,8 @@ int main(int count, char *argv[]) {
     int bytes;
     char *hostname, *portnum;
     nghttp2_session_callbacks *callbacks;
+    nfds_t npollfds = 1;
+    struct pollfd pollfds[1];
 
     if ( count != 4 ){
         printf("usage: %s <hostname> <portnum>\n", argv[0]);
@@ -416,6 +492,8 @@ int main(int count, char *argv[]) {
         exit(1);
     }
   
+    init_ssl_ctx(ctx);
+    
     ssl = SSL_new(ctx);      /* create new SSL connection state */
     if(ssl == NULL){
         ERR_print_errors_fp(stderr); 
@@ -474,13 +552,33 @@ int main(int count, char *argv[]) {
     /* Submit the HTTP request to the outbound queue. */
     submit_request(&connection, &req);
     
+    pollfds[0].fd = fd;
+    ctl_poll(pollfds, &connection);
+    
+      /* Event loop */
+    while (nghttp2_session_want_read(connection.session) ||
+         nghttp2_session_want_write(connection.session)) {
+       fprintf(stderr, "in loop\n");
+       int nfds = poll(pollfds, npollfds, -1);
+       if (nfds == -1) {
+          fprintf(stderr, "poll: %s", strerror(errno));
+       }
+       if (pollfds[0].revents & (POLLIN | POLLOUT)) {
+         exec_io(&connection);
+       }
+       if ((pollfds[0].revents & POLLHUP) || (pollfds[0].revents & POLLERR)) {
+          fprintf(stderr, "Connection error");
+       }
+       ctl_poll(pollfds, &connection);
+    }
+    
     printf("before cleaning\n\n");
     goto clean;
 
-    
-   
    
 clean:    
+    nghttp2_session_del(connection.session);
+    SSL_shutdown(ssl);
     SSL_free(ssl);        /* release connection state */
     SSL_CTX_free(ctx);        /* release context */
     close(fd);         /* close socket */
