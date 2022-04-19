@@ -15,9 +15,6 @@
 #include <poll.h>
 #define FAIL    -1
 
-
-
-
 enum { IO_NONE, WANT_READ, WANT_WRITE };
 
 #define MAKE_NV(NAME, VALUE)                                                   \
@@ -458,7 +455,7 @@ int main(int count, char *argv[]) {
     struct pollfd pollfds[1];
 
     if ( count != 4 ){
-        printf("usage: %s <hostname> <portnum>\n", argv[0]);
+        printf("usage: %s <hostname> <portnum> <resource>\n", argv[0]);
         exit(0);
     }
     hostname = argv[1];
