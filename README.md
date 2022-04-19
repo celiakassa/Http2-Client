@@ -5,5 +5,5 @@ Basic implementation of Http2 client in C langage
 gcc -o clienth2 clienth2.c -lnghttp2 -lssl -lcrypto
 
 #To run
-./clienth2 monitor.uac.bj 4449
+./clienth2 monitor.uac.bj 4449 /config
 
